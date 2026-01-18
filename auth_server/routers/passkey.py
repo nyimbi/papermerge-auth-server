@@ -21,9 +21,10 @@ def get_passkey_service(db: Session = Depends(get_db)) -> PasskeyService:
 	"""Get PasskeyService with configuration."""
 	return PasskeyService(
 		db=db,
-		rp_id=settings.webauthn_rp_id if hasattr(settings, 'webauthn_rp_id') else "localhost",
-		rp_name=settings.webauthn_rp_name if hasattr(settings, 'webauthn_rp_name') else "dArchiva",
-		origin=settings.webauthn_origin if hasattr(settings, 'webauthn_origin') else "https://localhost",
+		rp_id=settings.webauthn_rp_id,
+		rp_name=settings.webauthn_rp_name,
+		origin=settings.webauthn_origin,
+		timeout=settings.webauthn_timeout,
 	)
 
 

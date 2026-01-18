@@ -558,3 +558,43 @@ class Ownership(Base):
             f"{self.resource_type}:{self.resource_id} -> "
             f"{self.owner_type}:{self.owner_id})>"
         )
+
+
+class WebAuthnChallenge(Base):
+    """WebAuthn challenges for registration and authentication.
+
+    Challenges are stored in the database to support distributed deployments
+    and prevent replay attacks.
+    """
+
+    __tablename__ = "webauthn_challenges"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    challenge: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    challenge_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'registration' or 'authentication'
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,  # Null for discoverable credentials
+    )
+    device_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    username: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("idx_webauthn_challenge", "challenge"),
+        Index("idx_webauthn_challenge_expires", "expires_at"),
+        CheckConstraint(
+            "challenge_type IN ('registration', 'authentication')",
+            name="webauthn_challenge_type_check",
+        ),
+    )

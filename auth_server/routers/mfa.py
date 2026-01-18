@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 settings = get_settings()
 
-# In-memory MFA session storage (use Redis in production)
-_mfa_sessions: dict[str, dict] = {}
+# Database-backed MFA session storage via AuthSession table
+from auth_server.db.orm import AuthSession
 
 
 @router.post("/login", response_model=schema.MFALoginResponse)
@@ -77,7 +77,7 @@ async def mfa_login(
 				)
 
 		# MFA required but not provided - create MFA session
-		mfa_token = _create_mfa_session(user.id)
+		mfa_token = _create_mfa_session(db, user.id)
 		mfa_methods = []
 		if has_totp:
 			mfa_methods.append("totp")
@@ -111,7 +111,7 @@ async def verify_mfa(
 ) -> schema.MFALoginResponse:
 	"""Verify MFA code to complete login."""
 	# Validate MFA session
-	session = _validate_mfa_session(request.mfa_session_token)
+	session = _validate_mfa_session(db, request.mfa_session_token)
 	if not session:
 		raise HTTPException(
 			status_code=status.HTTP_401_UNAUTHORIZED,
@@ -147,7 +147,7 @@ async def verify_mfa(
 		)
 
 	# Clear MFA session
-	_clear_mfa_session(request.mfa_session_token)
+	_clear_mfa_session(db, request.mfa_session_token)
 
 	# Get user and create token
 	from auth_server.db import api as dbapi
@@ -169,35 +169,53 @@ async def verify_mfa(
 	)
 
 
-def _create_mfa_session(user_id: UUID, ttl_seconds: int = 300) -> str:
-	"""Create an MFA session token."""
+def _create_mfa_session(db: Session, user_id: UUID, ttl_seconds: int = 300) -> str:
+	"""Create an MFA session token in the database."""
 	token = hashlib.sha256(os.urandom(32)).hexdigest()
 	expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
 
-	_mfa_sessions[token] = {
-		"user_id": user_id,
-		"expires": expires,
-	}
+	session = AuthSession(
+		user_id=user_id,
+		session_token=token,
+		is_mfa_verified=False,
+		expires_at=expires,
+	)
+	db.add(session)
+	db.commit()
 
 	return token
 
 
-def _validate_mfa_session(token: str) -> dict | None:
-	"""Validate an MFA session token."""
-	session = _mfa_sessions.get(token)
+def _validate_mfa_session(db: Session, token: str) -> dict | None:
+	"""Validate an MFA session token from the database."""
+	from sqlalchemy import select
+
+	session = db.scalar(
+		select(AuthSession).where(
+			AuthSession.session_token == token,
+			AuthSession.is_mfa_verified == False,
+			AuthSession.expires_at > datetime.now(timezone.utc),
+		)
+	)
+
 	if not session:
 		return None
 
-	if datetime.now(timezone.utc) > session["expires"]:
-		del _mfa_sessions[token]
-		return None
+	return {
+		"user_id": session.user_id,
+		"expires": session.expires_at,
+		"session_id": session.id,
+	}
 
-	return session
 
+def _clear_mfa_session(db: Session, token: str) -> None:
+	"""Clear an MFA session from the database."""
+	from sqlalchemy import delete
 
-def _clear_mfa_session(token: str) -> None:
-	"""Clear an MFA session."""
-	_mfa_sessions.pop(token, None)
+	db.execute(
+		delete(AuthSession).where(AuthSession.session_token == token)
+	)
+	db.commit()
 
 
 async def _log_attempt(

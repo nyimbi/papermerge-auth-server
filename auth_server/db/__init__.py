@@ -3,7 +3,7 @@
 from .orm import (
 	User, Group, Role, Permission, Node, Folder,
 	TwoFactorAuth, PasskeyCredential, AuthSession, LoginAttempt,
-	Ownership, SpecialFolder
+	Ownership, SpecialFolder, WebAuthnChallenge
 )
 from .departments import Department, UserDepartment, DepartmentAccessRule
 from .base import Base
@@ -22,6 +22,7 @@ __all__ = [
 	'LoginAttempt',
 	'Ownership',
 	'SpecialFolder',
+	'WebAuthnChallenge',
 	'Department',
 	'UserDepartment',
 	'DepartmentAccessRule',

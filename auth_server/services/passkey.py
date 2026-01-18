@@ -1,18 +1,34 @@
 # (c) Copyright Datacraft, 2026
-"""WebAuthn/Passkey authentication service."""
+"""WebAuthn/Passkey authentication service with proper verification."""
 import logging
-import os
-import hashlib
-import json
 from uuid import UUID
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
-from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
+from webauthn import (
+	generate_registration_options,
+	verify_registration_response,
+	generate_authentication_options,
+	verify_authentication_response,
+)
+from webauthn.helpers import (
+	base64url_to_bytes,
+	bytes_to_base64url,
+)
+from webauthn.helpers.structs import (
+	AuthenticatorAttachment,
+	AuthenticatorSelectionCriteria,
+	AuthenticatorTransport,
+	COSEAlgorithmIdentifier,
+	PublicKeyCredentialDescriptor,
+	PublicKeyCredentialType,
+	ResidentKeyRequirement,
+	UserVerificationRequirement,
+)
 
-from auth_server.db.orm import PasskeyCredential, User
+from auth_server.db.orm import PasskeyCredential, User, WebAuthnChallenge
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +65,13 @@ class PasskeyResult:
 	credential_id: UUID | None = None
 	user_id: UUID | None = None
 	message: str | None = None
+	access_token: str | None = None
 
 
 class PasskeyService:
-	"""WebAuthn/Passkey authentication service."""
+	"""WebAuthn/Passkey authentication service with database-backed storage."""
+
+	CHALLENGE_EXPIRY_MINUTES = 5
 
 	def __init__(
 		self,
@@ -60,12 +79,13 @@ class PasskeyService:
 		rp_id: str = "localhost",
 		rp_name: str = "dArchiva",
 		origin: str = "https://localhost",
+		timeout: int = 60000,
 	):
 		self.db = db
 		self.rp_id = rp_id
 		self.rp_name = rp_name
 		self.origin = origin
-		self._challenges: dict[str, dict] = {}  # In production, use Redis
+		self.timeout = timeout
 
 	async def start_registration(
 		self,
@@ -77,44 +97,76 @@ class PasskeyService:
 		if not user:
 			raise ValueError(f"User not found: {user_id}")
 
-		# Generate challenge
-		challenge = os.urandom(32)
-		challenge_b64 = self._base64url_encode(challenge)
-
 		# Get existing credentials to exclude
 		existing = await self._get_user_credentials(user_id)
-		exclude_creds = [
-			{
-				"type": "public-key",
-				"id": self._base64url_encode(cred.credential_id),
-				"transports": ["internal", "usb", "ble", "nfc"],
-			}
+		exclude_credentials = [
+			PublicKeyCredentialDescriptor(
+				id=cred.credential_id,
+				type=PublicKeyCredentialType.PUBLIC_KEY,
+				transports=[AuthenticatorTransport.INTERNAL, AuthenticatorTransport.USB],
+			)
 			for cred in existing
+			if cred.is_active
 		]
 
-		# Store challenge for verification
-		self._challenges[challenge_b64] = {
-			"user_id": str(user_id),
-			"type": "registration",
-			"device_name": device_name,
-			"timestamp": datetime.now(timezone.utc).isoformat(),
-		}
+		# Generate registration options using py-webauthn
+		options = generate_registration_options(
+			rp_id=self.rp_id,
+			rp_name=self.rp_name,
+			user_id=str(user_id).encode(),
+			user_name=user.username,
+			user_display_name=f"{user.first_name} {user.last_name}".strip() or user.username,
+			timeout=self.timeout,
+			attestation="none",
+			authenticator_selection=AuthenticatorSelectionCriteria(
+				authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+				resident_key=ResidentKeyRequirement.PREFERRED,
+				user_verification=UserVerificationRequirement.PREFERRED,
+			),
+			supported_pub_key_algs=[
+				COSEAlgorithmIdentifier.ECDSA_SHA_256,
+				COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256,
+			],
+			exclude_credentials=exclude_credentials if exclude_credentials else None,
+		)
+
+		challenge_b64 = bytes_to_base64url(options.challenge)
+
+		# Store challenge in database
+		self._cleanup_expired_challenges()
+		db_challenge = WebAuthnChallenge(
+			challenge=challenge_b64,
+			challenge_type="registration",
+			user_id=user_id,
+			device_name=device_name,
+			expires_at=datetime.now(timezone.utc) + timedelta(minutes=self.CHALLENGE_EXPIRY_MINUTES),
+		)
+		self.db.add(db_challenge)
+		self.db.commit()
 
 		return RegistrationOptions(
 			challenge=challenge_b64,
 			rp_id=self.rp_id,
 			rp_name=self.rp_name,
-			user_id=self._base64url_encode(user_id.bytes),
+			user_id=bytes_to_base64url(str(user_id).encode()),
 			user_name=user.username,
 			user_display_name=f"{user.first_name} {user.last_name}".strip() or user.username,
-			timeout=60000,
+			timeout=self.timeout,
 			attestation="none",
 			authenticator_selection={
 				"authenticatorAttachment": "platform",
 				"residentKey": "preferred",
 				"userVerification": "preferred",
 			},
-			exclude_credentials=exclude_creds,
+			exclude_credentials=[
+				{
+					"type": "public-key",
+					"id": bytes_to_base64url(cred.credential_id),
+					"transports": ["internal", "usb"],
+				}
+				for cred in existing
+				if cred.is_active
+			],
 		)
 
 	async def complete_registration(
@@ -122,50 +174,46 @@ class PasskeyService:
 		challenge: str,
 		credential_response: dict,
 	) -> PasskeyResult:
-		"""Complete WebAuthn registration."""
-		# Verify challenge
-		if challenge not in self._challenges:
+		"""Complete WebAuthn registration with proper verification."""
+		# Get and validate challenge from database
+		db_challenge = self.db.scalar(
+			select(WebAuthnChallenge).where(
+				WebAuthnChallenge.challenge == challenge,
+				WebAuthnChallenge.challenge_type == "registration",
+				WebAuthnChallenge.used_at.is_(None),
+				WebAuthnChallenge.expires_at > datetime.now(timezone.utc),
+			)
+		)
+
+		if not db_challenge:
 			return PasskeyResult(success=False, message="Invalid or expired challenge")
 
-		challenge_data = self._challenges.pop(challenge)
-		if challenge_data["type"] != "registration":
-			return PasskeyResult(success=False, message="Challenge type mismatch")
-
-		user_id = UUID(challenge_data["user_id"])
+		user_id = db_challenge.user_id
+		device_name = db_challenge.device_name
 
 		try:
-			# Parse response
-			client_data_json = self._base64url_decode(
-				credential_response.get("response", {}).get("clientDataJSON", "")
+			# Verify the registration response using py-webauthn
+			verification = verify_registration_response(
+				credential=credential_response,
+				expected_challenge=base64url_to_bytes(challenge),
+				expected_rp_id=self.rp_id,
+				expected_origin=self.origin,
+				require_user_verification=False,
 			)
-			attestation_object = self._base64url_decode(
-				credential_response.get("response", {}).get("attestationObject", "")
-			)
 
-			# Verify client data
-			client_data = json.loads(client_data_json)
-			if client_data.get("type") != "webauthn.create":
-				return PasskeyResult(success=False, message="Invalid client data type")
-			if client_data.get("challenge") != challenge:
-				return PasskeyResult(success=False, message="Challenge mismatch")
-			if not client_data.get("origin", "").startswith(self.origin.split("://")[0]):
-				return PasskeyResult(success=False, message="Origin mismatch")
+			# Mark challenge as used
+			db_challenge.used_at = datetime.now(timezone.utc)
+			self.db.flush()
 
-			# Parse attestation object (simplified - full impl needs CBOR)
-			credential_id = self._base64url_decode(credential_response.get("id", ""))
-			public_key = self._extract_public_key(attestation_object)
-
-			if not credential_id or not public_key:
-				return PasskeyResult(success=False, message="Invalid credential data")
-
-			# Store credential
+			# Store credential in database
 			credential = PasskeyCredential(
 				user_id=user_id,
-				credential_id=credential_id,
-				public_key=public_key,
-				sign_count=0,
-				device_name=challenge_data.get("device_name"),
-				device_type=credential_response.get("authenticatorAttachment", "platform"),
+				credential_id=verification.credential_id,
+				public_key=verification.credential_public_key,
+				sign_count=verification.sign_count,
+				device_name=device_name,
+				device_type=verification.credential_device_type or "platform",
+				aaguid=verification.aaguid if verification.aaguid else None,
 				is_active=True,
 			)
 			self.db.add(credential)
@@ -182,6 +230,7 @@ class PasskeyService:
 
 		except Exception as e:
 			logger.error(f"Registration failed: {e}")
+			self.db.rollback()
 			return PasskeyResult(success=False, message=str(e))
 
 	async def start_authentication(
@@ -189,10 +238,6 @@ class PasskeyService:
 		username: str | None = None,
 	) -> AuthenticationOptions:
 		"""Generate WebAuthn authentication options."""
-		# Generate challenge
-		challenge = os.urandom(32)
-		challenge_b64 = self._base64url_encode(challenge)
-
 		allow_credentials = []
 
 		if username:
@@ -203,27 +248,49 @@ class PasskeyService:
 			if user:
 				credentials = await self._get_user_credentials(user.id)
 				allow_credentials = [
-					{
-						"type": "public-key",
-						"id": self._base64url_encode(cred.credential_id),
-						"transports": ["internal", "usb", "ble", "nfc"],
-					}
+					PublicKeyCredentialDescriptor(
+						id=cred.credential_id,
+						type=PublicKeyCredentialType.PUBLIC_KEY,
+						transports=[AuthenticatorTransport.INTERNAL, AuthenticatorTransport.USB],
+					)
 					for cred in credentials
 					if cred.is_active
 				]
 
-		# Store challenge
-		self._challenges[challenge_b64] = {
-			"username": username,
-			"type": "authentication",
-			"timestamp": datetime.now(timezone.utc).isoformat(),
-		}
+		# Generate authentication options using py-webauthn
+		options = generate_authentication_options(
+			rp_id=self.rp_id,
+			timeout=self.timeout,
+			allow_credentials=allow_credentials if allow_credentials else None,
+			user_verification=UserVerificationRequirement.PREFERRED,
+		)
+
+		challenge_b64 = bytes_to_base64url(options.challenge)
+
+		# Store challenge in database
+		self._cleanup_expired_challenges()
+		db_challenge = WebAuthnChallenge(
+			challenge=challenge_b64,
+			challenge_type="authentication",
+			username=username,
+			expires_at=datetime.now(timezone.utc) + timedelta(minutes=self.CHALLENGE_EXPIRY_MINUTES),
+		)
+		self.db.add(db_challenge)
+		self.db.commit()
 
 		return AuthenticationOptions(
 			challenge=challenge_b64,
 			rp_id=self.rp_id,
-			timeout=60000,
-			allow_credentials=allow_credentials,
+			timeout=self.timeout,
+			allow_credentials=[
+				{
+					"type": "public-key",
+					"id": bytes_to_base64url(cred.credential_id),
+					"transports": ["internal", "usb"],
+				}
+				for cred in (await self._get_user_credentials(user.id) if username and user else [])
+				if cred.is_active
+			],
 			user_verification="preferred",
 		)
 
@@ -232,18 +299,25 @@ class PasskeyService:
 		challenge: str,
 		credential_response: dict,
 	) -> PasskeyResult:
-		"""Complete WebAuthn authentication."""
-		# Verify challenge
-		if challenge not in self._challenges:
+		"""Complete WebAuthn authentication with proper verification."""
+		# Get and validate challenge from database
+		db_challenge = self.db.scalar(
+			select(WebAuthnChallenge).where(
+				WebAuthnChallenge.challenge == challenge,
+				WebAuthnChallenge.challenge_type == "authentication",
+				WebAuthnChallenge.used_at.is_(None),
+				WebAuthnChallenge.expires_at > datetime.now(timezone.utc),
+			)
+		)
+
+		if not db_challenge:
 			return PasskeyResult(success=False, message="Invalid or expired challenge")
 
-		challenge_data = self._challenges.pop(challenge)
-		if challenge_data["type"] != "authentication":
-			return PasskeyResult(success=False, message="Challenge type mismatch")
-
 		try:
-			# Get credential
-			credential_id = self._base64url_decode(credential_response.get("id", ""))
+			# Get credential from database by ID
+			credential_id_b64 = credential_response.get("id", "")
+			credential_id = base64url_to_bytes(credential_id_b64)
+
 			credential = self.db.scalar(
 				select(PasskeyCredential).where(
 					PasskeyCredential.credential_id == credential_id
@@ -251,40 +325,24 @@ class PasskeyService:
 			)
 
 			if not credential or not credential.is_active:
-				return PasskeyResult(success=False, message="Credential not found")
+				return PasskeyResult(success=False, message="Credential not found or inactive")
 
-			# Parse response
-			client_data_json = self._base64url_decode(
-				credential_response.get("response", {}).get("clientDataJSON", "")
+			# Verify the authentication response using py-webauthn
+			verification = verify_authentication_response(
+				credential=credential_response,
+				expected_challenge=base64url_to_bytes(challenge),
+				expected_rp_id=self.rp_id,
+				expected_origin=self.origin,
+				credential_public_key=credential.public_key,
+				credential_current_sign_count=credential.sign_count,
+				require_user_verification=False,
 			)
-			authenticator_data = self._base64url_decode(
-				credential_response.get("response", {}).get("authenticatorData", "")
-			)
-			signature = self._base64url_decode(
-				credential_response.get("response", {}).get("signature", "")
-			)
 
-			# Verify client data
-			client_data = json.loads(client_data_json)
-			if client_data.get("type") != "webauthn.get":
-				return PasskeyResult(success=False, message="Invalid client data type")
-			if client_data.get("challenge") != challenge:
-				return PasskeyResult(success=False, message="Challenge mismatch")
+			# Mark challenge as used
+			db_challenge.used_at = datetime.now(timezone.utc)
 
-			# Verify signature (simplified - full impl needs proper crypto)
-			if not self._verify_signature(
-				credential.public_key,
-				authenticator_data,
-				client_data_json,
-				signature,
-			):
-				return PasskeyResult(success=False, message="Signature verification failed")
-
-			# Update sign count
-			new_sign_count = int.from_bytes(authenticator_data[33:37], "big")
-			if new_sign_count <= credential.sign_count:
-				logger.warning(f"Possible cloned authenticator for credential {credential.id}")
-			credential.sign_count = new_sign_count
+			# Update credential sign count and last used
+			credential.sign_count = verification.new_sign_count
 			credential.last_used_at = datetime.now(timezone.utc)
 			self.db.commit()
 
@@ -298,6 +356,7 @@ class PasskeyService:
 
 		except Exception as e:
 			logger.error(f"Authentication failed: {e}")
+			self.db.rollback()
 			return PasskeyResult(success=False, message=str(e))
 
 	async def list_credentials(self, user_id: UUID) -> list[dict]:
@@ -338,38 +397,11 @@ class PasskeyService:
 		)
 		return list(self.db.scalars(stmt))
 
-	def _base64url_encode(self, data: bytes) -> str:
-		"""Base64url encode without padding."""
-		import base64
-		return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-	def _base64url_decode(self, data: str) -> bytes:
-		"""Base64url decode with padding fix."""
-		import base64
-		padding = 4 - len(data) % 4
-		if padding != 4:
-			data += "=" * padding
-		return base64.urlsafe_b64decode(data)
-
-	def _extract_public_key(self, attestation_object: bytes) -> bytes:
-		"""Extract public key from attestation object (simplified)."""
-		# Full implementation would use CBOR decoding
-		# For now, return the raw attestation object
-		# In production, use py_webauthn library
-		return attestation_object
-
-	def _verify_signature(
-		self,
-		public_key: bytes,
-		authenticator_data: bytes,
-		client_data_json: bytes,
-		signature: bytes,
-	) -> bool:
-		"""Verify WebAuthn signature (simplified)."""
-		# Full implementation would use proper COSE key parsing and signature verification
-		# For now, return True for demo - in production use py_webauthn
-		# The signature verification involves:
-		# 1. Hash client_data_json with SHA-256
-		# 2. Concatenate authenticator_data + hash
-		# 3. Verify signature against concatenated data using public key
-		return len(signature) > 0  # Placeholder
+	def _cleanup_expired_challenges(self) -> None:
+		"""Remove expired challenges from database."""
+		self.db.execute(
+			delete(WebAuthnChallenge).where(
+				WebAuthnChallenge.expires_at < datetime.now(timezone.utc)
+			)
+		)
+		self.db.flush()

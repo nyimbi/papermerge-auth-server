@@ -1,3 +1,4 @@
+# (c) Copyright Datacraft, 2026
 import logging
 from uuid import UUID
 
@@ -12,8 +13,14 @@ from auth_server.config import get_settings
 from auth_server import utils
 from auth_server.db.engine import Session
 from auth_server.db import api as dbapi
+from auth_server.routers import totp_router, passkey_router, mfa_router
 
-app = FastAPI()
+app = FastAPI(title="dArchiva Auth Server", version="1.0.0")
+
+# Include routers for 2FA and Passkeys
+app.include_router(totp_router)
+app.include_router(passkey_router)
+app.include_router(mfa_router)
 
 settings = get_settings()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")

@@ -242,6 +242,17 @@ class User(Base):
         secondary=user_groups_association, back_populates="users"
     )
 
+    # 2FA and Passkey relationships
+    two_factor_auth: Mapped["TwoFactorAuth | None"] = relationship(
+        "TwoFactorAuth", back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+    passkey_credentials: Mapped[list["PasskeyCredential"]] = relationship(
+        "PasskeyCredential", back_populates="user", cascade="all, delete-orphan"
+    )
+    auth_sessions: Mapped[list["AuthSession"]] = relationship(
+        "AuthSession", back_populates="user", cascade="all, delete-orphan"
+    )
+
     @property
     def home_folder_id(self) -> UUID | None:
         """
@@ -355,6 +366,142 @@ class Role(Base, AuditColumns):
     )
     users: Mapped[list["User"]] = relationship(  # noqa: F821
         secondary=users_roles_association, back_populates="roles"
+    )
+
+
+# (c) Copyright Datacraft, 2026
+# 2FA and Passkey Models
+
+
+class TwoFactorAuth(Base):
+    """Two-factor authentication settings for a user."""
+
+    __tablename__ = "two_factor_auth"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    secret_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(default=False)
+    is_verified: Mapped[bool] = mapped_column(default=False)
+    backup_codes: Mapped[list[str] | None] = mapped_column(
+        default=None
+    )  # JSON array of hashed backup codes
+    recovery_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    user: Mapped["User"] = relationship("User", back_populates="two_factor_auth")
+
+    __table_args__ = (
+        Index("idx_2fa_user_id", "user_id"),
+    )
+
+
+class PasskeyCredential(Base):
+    """WebAuthn/Passkey credentials for a user."""
+
+    __tablename__ = "passkey_credentials"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    credential_id: Mapped[bytes] = mapped_column(nullable=False, unique=True)
+    public_key: Mapped[bytes] = mapped_column(nullable=False)
+    sign_count: Mapped[int] = mapped_column(default=0)
+    device_name: Mapped[str] = mapped_column(String(100), nullable=True)
+    device_type: Mapped[str] = mapped_column(String(50), nullable=True)  # platform, cross-platform
+    aaguid: Mapped[bytes | None] = mapped_column(nullable=True)  # Authenticator AAGUID
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    user: Mapped["User"] = relationship("User", back_populates="passkey_credentials")
+
+    __table_args__ = (
+        Index("idx_passkey_user_id", "user_id"),
+        Index("idx_passkey_credential_id", "credential_id"),
+    )
+
+
+class AuthSession(Base):
+    """Active authentication sessions."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    device_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    is_mfa_verified: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+
+    user: Mapped["User"] = relationship("User", back_populates="auth_sessions")
+
+    __table_args__ = (
+        Index("idx_session_user_id", "user_id"),
+        Index("idx_session_token", "session_token"),
+        Index("idx_session_expires", "expires_at"),
+    )
+
+
+class LoginAttempt(Base):
+    """Track login attempts for security monitoring."""
+
+    __tablename__ = "login_attempts"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    username: Mapped[str] = mapped_column(String(150), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    success: Mapped[bool] = mapped_column(default=False)
+    failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    mfa_method: Mapped[str | None] = mapped_column(String(20), nullable=True)  # totp, passkey, backup
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_login_username", "username"),
+        Index("idx_login_ip", "ip_address"),
+        Index("idx_login_created", "created_at"),
     )
 
 

@@ -202,6 +202,7 @@ class User(Base):
     is_superuser: Mapped[bool] = mapped_column(default=False)
     is_staff: Mapped[bool] = mapped_column(default=True)
     is_active: Mapped[bool] = mapped_column(default=True)
+    clearance_level: Mapped[int] = mapped_column(default=0)  # For ABAC security clearance
 
     special_folders: Mapped[list["SpecialFolder"]] = relationship(
         "SpecialFolder",

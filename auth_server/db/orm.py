@@ -8,7 +8,7 @@ from sqlalchemy import String, DateTime, CheckConstraint, Index, UniqueConstrain
 
 from sqlalchemy import ForeignKey, String, func, Column, Table, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID as PGUUID, TIMESTAMP
+from sqlalchemy.dialects.postgresql import UUID as PGUUID, TIMESTAMP, JSONB
 from sqlalchemy import Enum as SQLEnum
 from .base import Base
 
@@ -391,7 +391,7 @@ class TwoFactorAuth(Base):
     is_enabled: Mapped[bool] = mapped_column(default=False)
     is_verified: Mapped[bool] = mapped_column(default=False)
     backup_codes: Mapped[list[str] | None] = mapped_column(
-        default=None
+        JSONB, nullable=True, default=None
     )  # JSON array of hashed backup codes
     recovery_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
